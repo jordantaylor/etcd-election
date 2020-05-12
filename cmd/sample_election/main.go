@@ -8,20 +8,31 @@ import (
 	"time"
 
 	etcd "github.com/coreos/etcd/clientv3"
-	election "github.com/jortaylor/etcd-election"
+	election "github.com/jordantaylor/etcd-election/pkg/election"
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	etcdEndpoint = "localhost:2379"
+
+	electionName   = "election_0"
+	candidateName  = "node_0"
+	candidateValue = "node_0"
+	ttlSec         = 35
+	resumeLead     = false
+	retrySec       = 2
+)
+
 func main() {
-	client, err := etcd.New(etcd.Config{Endpoints: []string{"localhost:2379"}})
+	client, err := etcd.New(etcd.Config{Endpoints: []string{etcdEndpoint}})
 	if err != nil {
 		log.Fatal("failed to create etcd client ", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	e := election.NewElection(ctx, "election_0", "node_0", false, 35, 2*time.Second, client)
+	e := election.NewElection(ctx, electionName, candidateName, resumeLead, ttlSec, retrySec*time.Second, client)
 
-	leaderChan, err := e.runElection()
+	leaderChan, err := e.RunElection()
 	if err != nil {
 		log.Fatal("problem running election ", err)
 	}

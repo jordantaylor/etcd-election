@@ -45,7 +45,7 @@ type Election struct {
 	election   *concurrency.Election
 }
 
-func (e *Election) runElection() (<-chan bool, error) {
+func (e *Election) RunElection() (<-chan bool, error) {
 	var (
 		observe <-chan etcd.GetResponse
 		node    *etcd.GetResponse
