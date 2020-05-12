@@ -10,24 +10,45 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func NewElection(
-	ctx context.Context,
-	electionName string,
-	candidateName string,
-	resumeLeader bool,
-	ttl int,
-	reconnectBackOff time.Duration,
-	client *etcd.Client,
-) *Election {
-	return &Election{
-		ctx:              ctx,
-		electionName:     electionName,
-		candidateName:    candidateName,
-		resumeLeader:     resumeLeader,
-		ttl:              ttl,
-		reconnectBackOff: reconnectBackOff,
-		client:           client,
+func New(c Config) (*Election, error) {
+	e := &Election{
+		ctx:              c.Context,
+		client:           c.Client,
+		electionName:     c.ElectionName,
+		candidateName:    c.CandidateName,
+		reconnectBackoff: c.ReconnectBackoff,
+		ttl:              c.TTL,
+		resumeLeader:     c.ResumeLeader,
 	}
+
+	if e.ctx == nil {
+		return nil, errors.New("a non-nil context value is required")
+	}
+
+	if e.candidateValue == "" {
+		e.candidateValue = e.candidateName
+	}
+
+	if e.reconnectBackoff.Milliseconds() <= 0 {
+		e.reconnectBackoff = 2 * time.Second
+	}
+
+	if e.ttl <= 0 {
+		e.ttl = 15
+	}
+
+	return e, nil
+}
+
+type Config struct {
+	Context          context.Context
+	Client           *etcd.Client
+	ElectionName     string
+	CandidateName    string
+	CandidateValue   string
+	ReconnectBackoff time.Duration
+	TTL              int
+	ResumeLeader     bool
 }
 
 type Election struct {
@@ -35,7 +56,8 @@ type Election struct {
 	client           *etcd.Client
 	electionName     string
 	candidateName    string
-	reconnectBackOff time.Duration
+	candidateValue   string
+	reconnectBackoff time.Duration
 	ttl              int
 	resumeLeader     bool
 
@@ -45,7 +67,7 @@ type Election struct {
 	election   *concurrency.Election
 }
 
-func (e *Election) RunElection() (<-chan bool, error) {
+func (e *Election) Run() (<-chan bool, error) {
 	var (
 		observe <-chan etcd.GetResponse
 		node    *etcd.GetResponse
@@ -54,13 +76,9 @@ func (e *Election) RunElection() (<-chan bool, error) {
 		ctx     = e.ctx
 	)
 
-	log.Info("pre newSession")
-
 	if err = e.newSession(ctx, 0); err != nil {
 		return nil, errors.Wrap(err, "while creating initial session")
 	}
-
-	log.Info("post newSession")
 
 	go func() {
 		e.leaderChan = make(chan bool)
@@ -206,7 +224,7 @@ func (e *Election) RunElection() (<-chan bool, error) {
 
 					log.Errorf("while creating new session: %s", err)
 
-					tick := time.NewTicker(e.reconnectBackOff)
+					tick := time.NewTicker(e.reconnectBackoff)
 					select {
 					case <-ctx.Done():
 						tick.Stop()
@@ -253,12 +271,12 @@ func (e *Election) setLeader(leaderState bool) {
 	}
 }
 
-func (e *Election) newSession(ctx context.Context, id int64) (err error) {
+func (e *Election) newSession(ctx context.Context, leaseID int64) (err error) {
 	e.session, err = concurrency.NewSession(
 		e.client,
 		concurrency.WithTTL(e.ttl),
 		concurrency.WithContext(ctx),
-		concurrency.WithLease(etcd.LeaseID(id)),
+		concurrency.WithLease(etcd.LeaseID(leaseID)),
 	)
 	if err != nil {
 		return

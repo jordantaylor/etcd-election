@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	etcd "github.com/coreos/etcd/clientv3"
 	election "github.com/jordantaylor/etcd-election/pkg/election"
@@ -13,28 +12,39 @@ import (
 )
 
 const (
-	etcdEndpoint = "localhost:2379"
-
+	etcdEndpoint   = "localhost:2379"
 	electionName   = "election_0"
 	candidateName  = "node_0"
 	candidateValue = "node_0"
-	ttlSec         = 35
-	resumeLead     = false
-	retrySec       = 2
 )
 
 func main() {
-	client, err := etcd.New(etcd.Config{Endpoints: []string{etcdEndpoint}})
+	var (
+		client      *etcd.Client
+		e           *election.Election
+		err         error
+		ctx, cancel = context.WithCancel(context.Background())
+	)
+
+	client, err = etcd.New(etcd.Config{Endpoints: []string{etcdEndpoint}})
 	if err != nil {
-		log.Fatal("failed to create etcd client ", err)
+		log.Fatal("failed to create etcd client: ", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	e := election.NewElection(ctx, electionName, candidateName, resumeLead, ttlSec, retrySec*time.Second, client)
-
-	leaderChan, err := e.RunElection()
+	e, err = election.New(election.Config{
+		Context:        ctx,
+		Client:         client,
+		ElectionName:   electionName,
+		CandidateName:  candidateName,
+		CandidateValue: candidateValue,
+	})
 	if err != nil {
-		log.Fatal("problem running election ", err)
+		log.Fatal("failed to create election: ", err)
+	}
+
+	leaderChan, err := e.Run()
+	if err != nil {
+		log.Fatal("problem running election: ", err)
 	}
 
 	c := make(chan os.Signal, 1)
