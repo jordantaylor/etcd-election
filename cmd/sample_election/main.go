@@ -13,7 +13,7 @@ import (
 
 const (
 	etcdEndpoint   = "localhost:2379"
-	electionName   = "election_0"
+	electionName   = "/tst/election_0"
 	candidateName  = "node_0"
 	candidateValue = "node_0"
 )

@@ -10,6 +10,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	DefaultTTLSec     = 35
+	DefaultBackoffSec = 2
+)
+
 func New(c Config) (*Election, error) {
 	e := &Election{
 		ctx:              c.Context,
@@ -21,6 +26,8 @@ func New(c Config) (*Election, error) {
 		resumeLeader:     c.ResumeLeader,
 	}
 
+	e.leaderChan = make(chan bool)
+
 	if e.ctx == nil {
 		return nil, errors.New("a non-nil context value is required")
 	}
@@ -30,11 +37,11 @@ func New(c Config) (*Election, error) {
 	}
 
 	if e.reconnectBackoff.Milliseconds() <= 0 {
-		e.reconnectBackoff = 2 * time.Second
+		e.reconnectBackoff = DefaultBackoffSec * time.Second
 	}
 
 	if e.ttl <= 0 {
-		e.ttl = 15
+		e.ttl = DefaultTTLSec
 	}
 
 	return e, nil
@@ -81,7 +88,6 @@ func (e *Election) Run() (<-chan bool, error) {
 	}
 
 	go func() {
-		e.leaderChan = make(chan bool)
 		defer close(e.leaderChan)
 
 		for {
@@ -89,7 +95,9 @@ func (e *Election) Run() (<-chan bool, error) {
 			if node, err = e.election.Leader(ctx); err != nil {
 				if err != concurrency.ErrElectionNoLeader {
 					log.Errorf("while determining election leader: %s", err)
-					goto reconnect
+					e.reconnect()
+
+					continue
 				}
 			} else {
 				// If we are resuming an election from which we previously had leadership we
@@ -106,7 +114,9 @@ func (e *Election) Run() (<-chan bool, error) {
 						// Recreate our session with the old lease id
 						if err = e.newSession(ctx, node.Kvs[0].Lease); err != nil {
 							log.Errorf("while re-establishing session with lease: %s", err)
-							goto reconnect
+							e.reconnect()
+
+							continue
 						}
 
 						e.election = concurrency.ResumeElection(
@@ -134,7 +144,9 @@ func (e *Election) Run() (<-chan bool, error) {
 						cancel()
 						if err != nil {
 							log.Errorf("while resigning leadership after reconnect: %s", err)
-							goto reconnect
+							e.reconnect()
+
+							continue
 						}
 					}
 				}
@@ -159,18 +171,20 @@ func (e *Election) Run() (<-chan bool, error) {
 					// NOTE: Campaign currently does not return an error if session expires
 					log.Errorf("while campaigning for leader: %s", err)
 					e.session.Close()
+					e.reconnect()
 
-					goto reconnect
+					continue
 				}
 			case <-ctx.Done():
 				e.session.Close()
 				return
 			case <-e.session.Done():
-				goto reconnect
+				e.reconnect()
+				continue
 			}
 
 		observe:
-			// If Campaign() returned without error, we are leader
+			// If Campaign() returned without error, we are the leader
 			e.setLeader(true)
 
 			// Observe changes to leadership
@@ -180,23 +194,23 @@ func (e *Election) Run() (<-chan bool, error) {
 				select {
 				case resp, ok := <-observe:
 					if !ok {
-						// NOTE: Observe will not close if the session expires, we must
-						// watch for session.Done()
+						// NOTE: Observe will not close if the session expires, we must watch for session.Done()
 						e.session.Close()
-						goto reconnect
+						e.reconnect()
+
+						continue
 					}
 
 					if string(resp.Kvs[0].Value) == e.candidateName {
 						e.setLeader(true)
 					} else {
-						// We are not leader
+						// We are not the leader
 						e.setLeader(false)
 						break
 					}
 				case <-ctx.Done():
 					if e.isLeader {
-						// If resign takes longer than our TTL then lease is expired and we are no
-						// longer leader anyway.
+						// If resign takes longer than our TTL, the lease has expired and we are no longer the leader
 						ctx, cancel := context.WithTimeout(context.Background(), time.Duration(e.ttl)*time.Second)
 						if err = e.election.Resign(ctx); err != nil {
 							log.Errorf("while resigning leadership during shutdown: %s", err)
@@ -209,34 +223,9 @@ func (e *Election) Run() (<-chan bool, error) {
 
 					return
 				case <-e.session.Done():
-					goto reconnect
-				}
-			}
-
-		reconnect:
-			e.setLeader(false)
-
-			for {
-				if err = e.newSession(ctx, 0); err != nil {
-					if errors.Cause(err) == context.Canceled {
-						return
-					}
-
-					log.Errorf("while creating new session: %s", err)
-
-					tick := time.NewTicker(e.reconnectBackoff)
-					select {
-					case <-ctx.Done():
-						tick.Stop()
-						return
-					case <-tick.C:
-						tick.Stop()
-					}
-
+					e.reconnect()
 					continue
 				}
-
-				break
 			}
 		}
 	}()
@@ -262,6 +251,39 @@ func (e *Election) Run() (<-chan bool, error) {
 	}
 
 	return e.leaderChan, nil
+}
+
+func (e *Election) reconnect() {
+	var err error
+
+	e.setLeader(false)
+
+	for {
+		log.Info("trying to reconnect...")
+
+		if err = e.newSession(e.ctx, 0); err != nil {
+			if errors.Cause(err) == context.Canceled {
+				return
+			}
+
+			log.Error("while creating new session: ", err)
+
+			tick := time.NewTicker(e.reconnectBackoff)
+			select {
+			case <-e.ctx.Done():
+				tick.Stop()
+				return
+			case <-tick.C:
+				tick.Stop()
+			}
+
+			continue
+		}
+
+		log.Info("reconnected successfully")
+
+		return
+	}
 }
 
 func (e *Election) setLeader(leaderState bool) {
