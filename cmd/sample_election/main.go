@@ -12,10 +12,9 @@ import (
 )
 
 const (
-	etcdEndpoint   = "localhost:2379"
-	electionName   = "/tst/election_0"
-	candidateName  = "node_0"
-	candidateValue = "node_0"
+	etcdEndpoint  = "localhost:2379"
+	electionName  = "/tst/election_"
+	candidateName = "node_0"
 )
 
 func main() {
@@ -26,17 +25,19 @@ func main() {
 		ctx, cancel = context.WithCancel(context.Background())
 	)
 
+	log.SetLevel(log.InfoLevel)
+
 	client, err = etcd.New(etcd.Config{Endpoints: []string{etcdEndpoint}})
 	if err != nil {
 		log.Fatal("failed to create etcd client: ", err)
 	}
 
 	e, err = election.New(election.Config{
-		Context:        ctx,
-		Client:         client,
-		ElectionName:   electionName,
-		CandidateName:  candidateName,
-		CandidateValue: candidateValue,
+		Context:       ctx,
+		Client:        client,
+		ElectionName:  electionName,
+		CandidateName: candidateName,
+		ResumeLeader:  true,
 	})
 	if err != nil {
 		log.Fatal("failed to create election: ", err)
