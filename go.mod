@@ -15,5 +15,6 @@ require (
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v1.0.0 // indirect
 	github.com/spf13/viper v1.6.2
+	go.etcd.io/etcd v3.3.20+incompatible
 	go.etcd.io/etcd/v3 v3.3.0-rc.0.0.20200506145422-035e1db0a207
 )

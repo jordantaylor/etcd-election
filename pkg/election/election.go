@@ -6,6 +6,7 @@ import (
 
 	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
+	"github.com/coreos/etcd/mvcc/mvccpb"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -107,7 +108,6 @@ func (e *Election) Run() (<-chan bool, error) {
 
 func (e *Election) manageElection() {
 	var (
-		//observe <-chan etcd.GetResponse
 		node    *etcd.GetResponse
 		err     error
 		errChan chan error
@@ -116,6 +116,8 @@ func (e *Election) manageElection() {
 	defer close(e.leaderChan)
 
 	for {
+		errChan = make(chan error)
+
 		// Discover who if any, is leader of this election
 		if node, err = e.election.Leader(e.ctx); err != nil {
 			if err != concurrency.ErrElectionNoLeader {
@@ -129,66 +131,16 @@ func (e *Election) manageElection() {
 				continue
 			}
 		} else {
-			// If we are resuming an election from which we previously had leadership we
-			// have 2 options
-			// 1. Resume the leadership if the lease has not expired. This is a race as the
-			//    lease could expire in between the `Leader()` call and when we resume
-			//    observing changes to the election. If this happens we should detect the
-			//    session has expired during the observation loop.
-			// 2. Resign the leadership immediately to allow a new leader to be chosen.
-			//    This option will almost always result in transfer of leadership.
 			if string(node.Kvs[0].Value) == e.candidateName {
-				// resume as leader if resumeLeadership is true
-				if e.resumeLeader {
-					// Recreate our session with the old lease id
-					if err = e.newSession(e.ctx, node.Kvs[0].Lease); err != nil {
-						log.Error("unable to re-establish session with lease: ", err)
-						e.reconnect()
-
-						continue
-					}
-
-					e.election = concurrency.ResumeElection(
-						e.session,
-						e.electionName,
-						string(node.Kvs[0].Key),
-						node.Kvs[0].CreateRevision,
-					)
-
-					// Because Campaign() only returns if the election entry doesn't exist
-					// we must skip the campaign call and go directly to observe when resuming
-
-					//goto observe
-					if e.observe() {
-						log.Info("resigned leadership and now exiting")
-						return
-					}
-				} else {
-					// If resign takes longer than our TTL then lease is expired and we are no
-					// longer leader anyway.
-					ctx, cancel := context.WithTimeout(e.ctx, time.Duration(e.ttl)*time.Second)
-					e.election = concurrency.ResumeElection(
-						e.session,
-						e.electionName,
-						string(node.Kvs[0].Key),
-						node.Kvs[0].CreateRevision,
-					)
-
-					err = e.election.Resign(ctx)
-					cancel()
-					if err != nil {
-						log.Errorf("while resigning leadership after reconnect: %s", err)
-						e.reconnect()
-
-						//continue
-					}
+				if resign := e.leaderResumeElection(node.Kvs[0]); resign {
+					return
 				}
+				continue
 			}
 		}
 		// Reset leadership if we had it previously
 		e.setLeader(false)
 
-		errChan = make(chan error)
 		// Make this a non blocking call so we can check for session close
 		go func() {
 			errChan <- e.election.Campaign(e.ctx, e.candidateName)
@@ -217,7 +169,48 @@ func (e *Election) manageElection() {
 	}
 }
 
-//func (e *Election) resumeOrResign()
+// leaderResumeElection attempts to resume an election it had leadership of previously
+// we have 2 options:
+//    1. Resume the leadership if the lease has not expired. This is a race as the
+//       lease could expire in between the `Leader()` call and when we resume
+//       observing changes to the election. If this happens we should detect the
+//       session has expired during the observation loop.
+//    2. Resign the leadership immediately to allow a new leader to be chosen.
+//       This option will almost always result in transfer of leadership.
+func (e *Election) leaderResumeElection(kv *mvccpb.KeyValue) (resign bool) {
+	if e.resumeLeader {
+		// Recreate our session with the old lease id
+		if err := e.newSession(e.ctx, kv.Lease); err != nil {
+			log.Error("unable to re-establish session with lease: ", err)
+			e.reconnect()
+
+			return false
+		}
+
+		e.election = concurrency.ResumeElection(e.session, e.electionName, string(kv.Key), kv.CreateRevision)
+
+		// Because Campaign() only returns if the election entry doesn't exist
+		// we must skip the campaign call and go directly to observe when resuming
+		if e.observe() {
+			log.Info("resigned leadership and now exiting")
+			return true
+		}
+	} else {
+		// If resign takes longer than our TTL then lease is expired and we are no
+		// longer leader anyway.
+		ctx, cancel := context.WithTimeout(e.ctx, time.Duration(e.ttl)*time.Second)
+		e.election = concurrency.ResumeElection(e.session, e.electionName, string(kv.Key), kv.CreateRevision)
+
+		err := e.election.Resign(ctx)
+		cancel()
+		if err != nil {
+			log.Errorf("while resigning leadership after reconnect: %s", err)
+			e.reconnect()
+		}
+	}
+
+	return false
+}
 
 func (e *Election) observe() (halt bool) {
 	// If Campaign() returned without error, we are the leader
