@@ -16,18 +16,26 @@ const (
 	DefaultBackoffSec = 2
 )
 
+type Leader struct {
+	IsLeader bool
+	URI      string
+}
+
 func New(c Config) (*Election, error) {
 	e := &Election{
 		ctx:              c.Context,
 		client:           c.Client,
 		electionName:     c.ElectionName,
-		candidateName:    c.CandidateName,
+		CandidateName:    c.CandidateName,
 		reconnectBackoff: c.ReconnectBackoff,
 		ttl:              c.TTL,
 		resumeLeader:     c.ResumeLeader,
+		leader: &Leader{
+			IsLeader: false,
+			URI:      "",
+		},
+		leaderChan: make(chan Leader),
 	}
-
-	e.leaderChan = make(chan bool)
 
 	if e.ctx == nil {
 		return nil, errors.New("a non-nil context value is required")
@@ -58,20 +66,22 @@ type Election struct {
 	ctx              context.Context
 	client           *etcd.Client
 	electionName     string
-	candidateName    string
 	reconnectBackoff time.Duration
 	ttl              int
 	resumeLeader     bool
 
-	isLeader   bool
-	leaderChan chan bool
-	session    *concurrency.Session
-	election   *concurrency.Election
+	leader     *Leader
+	leaderChan chan Leader
+
+	session  *concurrency.Session
+	election *concurrency.Election
+
+	CandidateName string
 }
 
 // Run will start the election management goroutine and returns once the first leader has been decided
 // subsequent leaders will automatically be determined by the manageElection goroutine after the initial call to Run().
-func (e *Election) Run() (<-chan bool, error) {
+func (e *Election) Run() (<-chan Leader, error) {
 	if err := e.newSession(e.ctx, 0); err != nil {
 		return nil, errors.Wrap(err, "while creating initial session")
 	}
@@ -96,7 +106,7 @@ func (e *Election) Run() (<-chan bool, error) {
 		leader := string(resp.Kvs[0].Value)
 		log.Info("leader is ", leader)
 
-		if leader != e.candidateName {
+		if leader != e.CandidateName {
 			e.setLeader(false)
 		}
 
@@ -131,7 +141,7 @@ func (e *Election) manageElection() {
 				continue
 			}
 		} else {
-			if string(node.Kvs[0].Value) == e.candidateName {
+			if string(node.Kvs[0].Value) == e.CandidateName {
 				if resign := e.leaderResumeElection(node.Kvs[0]); resign {
 					return
 				}
@@ -143,7 +153,7 @@ func (e *Election) manageElection() {
 
 		// Make this a non blocking call so we can check for session close
 		go func() {
-			errChan <- e.election.Campaign(e.ctx, e.candidateName)
+			errChan <- e.election.Campaign(e.ctx, e.CandidateName)
 		}()
 
 		select {
@@ -230,16 +240,16 @@ func (e *Election) observe() (halt bool) {
 				continue
 			}
 
-			e.setLeader(string(resp.Kvs[0].Value) == e.candidateName)
+			e.setLeader(string(resp.Kvs[0].Value) == e.CandidateName)
 
 			log.Info("observed response with value of ", string(resp.Kvs[0].Value))
 
-			if !e.isLeader {
+			if !e.getLeader() {
 				e.reconnect()
 				return
 			}
 		case <-e.ctx.Done():
-			if e.isLeader {
+			if e.getLeader() {
 				// If resign takes longer than our TTL, the lease has expired and we are no longer the leader
 				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(e.ttl)*time.Second)
 				if err := e.election.Resign(ctx); err != nil {
@@ -295,10 +305,17 @@ func (e *Election) reconnect() {
 }
 
 func (e *Election) setLeader(leaderState bool) {
-	if e.isLeader != leaderState {
-		e.isLeader = leaderState
-		e.leaderChan <- e.isLeader
+	if e.leader.IsLeader != leaderState {
+		e.leader.IsLeader = leaderState
+		e.leaderChan <- Leader{
+			IsLeader: leaderState,
+			URI:      "test.leader.uri",
+		}
 	}
+}
+
+func (e *Election) getLeader() (isLeader bool) {
+	return e.leader.IsLeader
 }
 
 func (e *Election) newSession(ctx context.Context, leaseID int64) (err error) {

@@ -58,8 +58,8 @@ func main() {
 		}
 	}()
 
-	for leader := range leaderChan {
-		log.Info("leader: ", leader)
+	for l := range leaderChan {
+		log.Infof("leader update: IsLeader: %+v, URI: %s", l.IsLeader, l.URI)
 	}
 
 	cancel()
