@@ -79,39 +79,13 @@ type Election struct {
 	CandidateName string
 }
 
-// Run will start the election management goroutine and returns once the first leader has been decided
-// subsequent leaders will automatically be determined by the manageElection goroutine after the initial call to Run().
+// Run will start the election management goroutine and returns a channel for reading leader status updates
 func (e *Election) Run() (<-chan Leader, error) {
 	if err := e.newSession(e.ctx, 0); err != nil {
 		return nil, errors.Wrap(err, "while creating initial session")
 	}
 
 	go e.manageElection()
-
-	// Wait until we have a leader before returning
-	for {
-		resp, err := e.election.Leader(e.ctx)
-		if err != nil {
-			if err != concurrency.ErrElectionNoLeader {
-				return nil, err
-			}
-
-			time.Sleep(time.Millisecond * 300)
-
-			log.Info("no leader set yet")
-
-			continue
-		}
-		// If we are not leader, notify the channel
-		leader := string(resp.Kvs[0].Value)
-		log.Info("leader is ", leader)
-
-		if leader != e.CandidateName {
-			e.setLeader(false)
-		}
-
-		break
-	}
 
 	return e.leaderChan, nil
 }
@@ -141,13 +115,21 @@ func (e *Election) manageElection() {
 				continue
 			}
 		} else {
-			if string(node.Kvs[0].Value) == e.CandidateName {
-				if resign := e.leaderResumeElection(node.Kvs[0]); resign {
-					return
+			if len(node.Kvs) > 0 {
+				l := string(node.Kvs[0].Value)
+				if l == e.CandidateName {
+					if resign := e.leaderResumeElection(node.Kvs[0]); resign {
+						return
+					}
+				} else {
+					e.leaderChan <- Leader{IsLeader: l == e.CandidateName, URI: l}
 				}
+			} else {
+				log.Error("unexpected empty Kvs response from etcd with nil error")
 				continue
 			}
 		}
+
 		// Reset leadership if we had it previously
 		e.setLeader(false)
 
@@ -156,27 +138,74 @@ func (e *Election) manageElection() {
 			errChan <- e.election.Campaign(e.ctx, e.CandidateName)
 		}()
 
+		/*if e.checkEvents(errChan) {
+			return
+		}*/
 		select {
 		case err = <-errChan:
 			if err != nil {
 				if errors.Cause(err) == context.Canceled {
 					return
 				}
+
 				// NOTE: Campaign currently does not return an error if session expires
-				log.Errorf("while campaigning for leader: %s", err)
-				e.session.Close()
+				log.Error("problem campaigning for leader: ", err)
+
+				if er := e.session.Close(); er != nil {
+					log.Warn("problem closing session: ", er)
+				}
+
 				e.reconnect()
 
 				continue
 			}
 		case <-e.ctx.Done():
-			e.session.Close()
+			if er := e.session.Close(); er != nil {
+				log.Warn("problem closing session: ", er)
+			}
+
 			return
 		case <-e.session.Done():
 			e.reconnect()
 			continue
 		}
 	}
+}
+
+// checkEvents will reconnect if an election error happens or the session expires, and will
+// inform the main routine to exit if the Election's context expires.
+// TODO: switch to using this standalone function once issues are resolved
+func (e *Election) checkEvents(errChan chan error) (done bool) {
+	select {
+	case err := <-errChan:
+		if err != nil {
+			if errors.Cause(err) == context.Canceled {
+				return true
+			}
+
+			// NOTE: Campaign currently does not return an error if session expires
+			log.Error("problem campaigning for leader: ", err)
+
+			if er := e.session.Close(); er != nil {
+				log.Warn("problem closing session: ", er)
+			}
+
+			e.reconnect()
+
+			return
+		}
+	case <-e.ctx.Done():
+		if err := e.session.Close(); err != nil {
+			log.Warn("problem closing session: ", err)
+		}
+
+		return true
+	case <-e.session.Done():
+		e.reconnect()
+		return
+	}
+
+	return false
 }
 
 // leaderResumeElection attempts to resume an election it had leadership of previously
@@ -236,17 +265,16 @@ func (e *Election) observe() (halt bool) {
 				// NOTE: Observe will not close if the session expires, we must watch for session.Done()
 				e.session.Close()
 				e.reconnect()
-
-				continue
 			}
 
-			e.setLeader(string(resp.Kvs[0].Value) == e.CandidateName)
+			if len(resp.Kvs) > 0 {
+				e.setLeader(string(resp.Kvs[0].Value) == e.CandidateName)
+				log.Info("observed response with value of ", string(resp.Kvs[0].Value))
 
-			log.Info("observed response with value of ", string(resp.Kvs[0].Value))
-
-			if !e.getLeader() {
-				e.reconnect()
-				return
+				if !e.getLeader() {
+					e.reconnect()
+					return
+				}
 			}
 		case <-e.ctx.Done():
 			if e.getLeader() {
