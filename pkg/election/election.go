@@ -138,9 +138,6 @@ func (e *Election) manageElection() {
 			errChan <- e.election.Campaign(e.ctx, e.CandidateName)
 		}()
 
-		/*if e.checkEvents(errChan) {
-			return
-		}*/
 		select {
 		case err = <-errChan:
 			if err != nil {
@@ -170,42 +167,6 @@ func (e *Election) manageElection() {
 			continue
 		}
 	}
-}
-
-// checkEvents will reconnect if an election error happens or the session expires, and will
-// inform the main routine to exit if the Election's context expires.
-// TODO: switch to using this standalone function once issues are resolved
-func (e *Election) checkEvents(errChan chan error) (done bool) {
-	select {
-	case err := <-errChan:
-		if err != nil {
-			if errors.Cause(err) == context.Canceled {
-				return true
-			}
-
-			// NOTE: Campaign currently does not return an error if session expires
-			log.Error("problem campaigning for leader: ", err)
-
-			if er := e.session.Close(); er != nil {
-				log.Warn("problem closing session: ", er)
-			}
-
-			e.reconnect()
-
-			return
-		}
-	case <-e.ctx.Done():
-		if err := e.session.Close(); err != nil {
-			log.Warn("problem closing session: ", err)
-		}
-
-		return true
-	case <-e.session.Done():
-		e.reconnect()
-		return
-	}
-
-	return false
 }
 
 // leaderResumeElection attempts to resume an election it had leadership of previously
@@ -253,7 +214,7 @@ func (e *Election) leaderResumeElection(kv *mvccpb.KeyValue) (resign bool) {
 
 func (e *Election) observe() (halt bool) {
 	// If Campaign() returned without error, we are the leader
-	e.setLeader(true)
+	e.setLeader(true, e.CandidateName)
 
 	// Observe changes to leadership
 	observe := e.election.Observe(e.ctx)
@@ -268,8 +229,9 @@ func (e *Election) observe() (halt bool) {
 			}
 
 			if len(resp.Kvs) > 0 {
-				e.setLeader(string(resp.Kvs[0].Value) == e.CandidateName)
-				log.Info("observed response with value of ", string(resp.Kvs[0].Value))
+				l := string(resp.Kvs[0].Value)
+				e.setLeader(l == e.CandidateName, l)
+				log.Info("observed response with value of ", l)
 
 				if !e.getLeader() {
 					e.reconnect()
@@ -332,12 +294,17 @@ func (e *Election) reconnect() {
 	}
 }
 
-func (e *Election) setLeader(leaderState bool) {
+func (e *Election) setLeader(leaderState bool, uri ...string) {
 	if e.leader.IsLeader != leaderState {
 		e.leader.IsLeader = leaderState
+
+		if len(uri) > 0 {
+			e.leader.URI = uri[0]
+		}
+
 		e.leaderChan <- Leader{
 			IsLeader: leaderState,
-			URI:      "test.leader.uri",
+			URI:      e.leader.URI,
 		}
 	}
 }

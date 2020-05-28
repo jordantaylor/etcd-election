@@ -52,10 +52,9 @@ func main() {
 	signal.Notify(c, syscall.SIGINT)
 
 	go func() {
-		for range c {
-			log.Info("resigning leadership and exiting")
-			cancel()
-		}
+		<-c
+		log.Info("resigning leadership and exiting")
+		cancel()
 	}()
 
 	for l := range leaderChan {
