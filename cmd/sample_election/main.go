@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,23 +12,22 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const (
-	etcdEndpoint  = "localhost:2379"
-	electionName  = "/tst/election_"
-	candidateName = "node_0"
-)
-
 func main() {
 	var (
 		client      *etcd.Client
 		e           *election.Election
 		err         error
 		ctx, cancel = context.WithCancel(context.Background())
+
+		candidateName = flag.String("candidate", "node_0", "name of the candidate to run as")
+		electionName  = flag.String("prefix", "/test/election", "election prefix to run for")
+		etcdEndpoint  = flag.String("endpoint", "localhost:2379", "URI for etcd instance to use for election")
 	)
 
+	flag.Parse()
 	log.SetLevel(log.InfoLevel)
 
-	client, err = etcd.New(etcd.Config{Endpoints: []string{etcdEndpoint}})
+	client, err = etcd.New(etcd.Config{Endpoints: []string{*etcdEndpoint}})
 	if err != nil {
 		log.Fatal("failed to create etcd client: ", err)
 	}
@@ -35,8 +35,8 @@ func main() {
 	e, err = election.New(election.Config{
 		Context:       ctx,
 		Client:        client,
-		ElectionName:  electionName,
-		CandidateName: candidateName,
+		ElectionName:  *electionName,
+		CandidateName: *candidateName,
 		ResumeLeader:  true,
 	})
 	if err != nil {
@@ -52,14 +52,13 @@ func main() {
 	signal.Notify(c, syscall.SIGINT)
 
 	go func() {
-		for range c {
-			log.Info("resigning leadership and exiting")
-			cancel()
-		}
+		<-c
+		log.Info("resigning leadership and exiting")
+		cancel()
 	}()
 
-	for leader := range leaderChan {
-		log.Info("leader: ", leader)
+	for l := range leaderChan {
+		log.Infof("leader update: IsLeader: %+v, URI: %s", l.IsLeader, l.URI)
 	}
 
 	cancel()
