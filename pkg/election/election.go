@@ -115,72 +115,49 @@ func (e *Election) manageElection() {
 				continue
 			}
 		} else {
-			if len(node.Kvs) > 0 {
-				l := string(node.Kvs[0].Value)
-				if l == e.CandidateName {
-					if resign := e.leaderResumeElection(node.Kvs[0]); resign {
-						return
-					}
-				} else {
-					e.leaderChan <- Leader{IsLeader: l == e.CandidateName, URI: l}
-				}
-			} else {
+			if len(node.Kvs) == 0 {
 				log.Error("unexpected empty Kvs response from etcd with nil error")
 				continue
+			}
+
+			if l := string(node.Kvs[0].Value); l == e.CandidateName {
+				if err := e.leaderResumeElection(node.Kvs[0]); err != nil {
+					if _, ok := err.(ErrContextCanceled); ok {
+						e.teardown()
+						return
+					}
+				}
+			} else {
+				e.leaderChan <- Leader{IsLeader: l == e.CandidateName, URI: l}
 			}
 		}
 
 		// Reset leadership if we had it previously
-		e.setLeader(false)
+		e.setLeader(false, "")
 
 		// Make this a non blocking call so we can check for session close
 		go func() {
 			errChan <- e.election.Campaign(e.ctx, e.CandidateName)
 		}()
 
-		/*if e.checkEvents(errChan) {
+		switch (e.checkEvents(errChan)).(type) {
+		case ErrContextCanceled:
+			e.teardown()
 			return
-		}*/
-		select {
-		case err = <-errChan:
-			if err != nil {
-				if errors.Cause(err) == context.Canceled {
-					return
-				}
-
-				// NOTE: Campaign currently does not return an error if session expires
-				log.Error("problem campaigning for leader: ", err)
-
-				if er := e.session.Close(); er != nil {
-					log.Warn("problem closing session: ", er)
-				}
-
-				e.reconnect()
-
-				continue
-			}
-		case <-e.ctx.Done():
-			if er := e.session.Close(); er != nil {
-				log.Warn("problem closing session: ", er)
-			}
-
-			return
-		case <-e.session.Done():
+		case ErrConnectionLost:
 			e.reconnect()
-			continue
 		}
 	}
 }
 
 // checkEvents will reconnect if an election error happens or the session expires, and will
 // inform the main routine to exit if the Election's context expires.
-// TODO: switch to using this standalone function once issues are resolved
-func (e *Election) checkEvents(errChan chan error) (done bool) {
+func (e *Election) checkEvents(errChan chan error) error {
 	select {
 	case err := <-errChan:
 		if err != nil {
 			if errors.Cause(err) == context.Canceled {
-				return true
+				return &ErrContextCanceled{}
 			}
 
 			// NOTE: Campaign currently does not return an error if session expires
@@ -190,22 +167,30 @@ func (e *Election) checkEvents(errChan chan error) (done bool) {
 				log.Warn("problem closing session: ", er)
 			}
 
-			e.reconnect()
-
-			return
+			return &ErrConnectionLost{}
 		}
 	case <-e.ctx.Done():
-		if err := e.session.Close(); err != nil {
+		if err := e.session.Close(); err != nil && err != context.Canceled {
 			log.Warn("problem closing session: ", err)
 		}
 
-		return true
+		return &ErrContextCanceled{}
 	case <-e.session.Done():
-		e.reconnect()
-		return
+		return &ErrConnectionLost{}
 	}
 
-	return false
+	return nil
+}
+
+func (e *Election) teardown() {
+	to, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := e.election.Resign(to); err != nil {
+		log.Error("when trying to teardown: ", err)
+	}
+
+	e.session.Close()
 }
 
 // leaderResumeElection attempts to resume an election it had leadership of previously
@@ -216,23 +201,20 @@ func (e *Election) checkEvents(errChan chan error) (done bool) {
 //       session has expired during the observation loop.
 //    2. Resign the leadership immediately to allow a new leader to be chosen.
 //       This option will almost always result in transfer of leadership.
-func (e *Election) leaderResumeElection(kv *mvccpb.KeyValue) (resign bool) {
+func (e *Election) leaderResumeElection(kv *mvccpb.KeyValue) error {
 	if e.resumeLeader {
 		// Recreate our session with the old lease id
 		if err := e.newSession(e.ctx, kv.Lease); err != nil {
 			log.Error("unable to re-establish session with lease: ", err)
-			e.reconnect()
-
-			return false
+			return &ErrConnectionLost{}
 		}
 
 		e.election = concurrency.ResumeElection(e.session, e.electionName, string(kv.Key), kv.CreateRevision)
 
 		// Because Campaign() only returns if the election entry doesn't exist
 		// we must skip the campaign call and go directly to observe when resuming
-		if e.observe() {
-			log.Info("resigned leadership and now exiting")
-			return true
+		if err := e.observe(); err != nil {
+			return &ErrContextCanceled{}
 		}
 	} else {
 		// If resign takes longer than our TTL then lease is expired and we are no
@@ -244,16 +226,17 @@ func (e *Election) leaderResumeElection(kv *mvccpb.KeyValue) (resign bool) {
 		cancel()
 		if err != nil {
 			log.Errorf("while resigning leadership after reconnect: %s", err)
-			e.reconnect()
+			//e.reconnect()
+			return &ErrConnectionLost{}
 		}
 	}
 
-	return false
+	return nil
 }
 
-func (e *Election) observe() (halt bool) {
+func (e *Election) observe() error {
 	// If Campaign() returned without error, we are the leader
-	e.setLeader(true)
+	e.setLeader(true, e.CandidateName)
 
 	// Observe changes to leadership
 	observe := e.election.Observe(e.ctx)
@@ -268,30 +251,17 @@ func (e *Election) observe() (halt bool) {
 			}
 
 			if len(resp.Kvs) > 0 {
-				e.setLeader(string(resp.Kvs[0].Value) == e.CandidateName)
-				log.Info("observed response with value of ", string(resp.Kvs[0].Value))
+				leaderURI := string(resp.Kvs[0].Value)
+				e.setLeader(leaderURI == e.CandidateName, leaderURI)
+				log.Info("observed response with value of ", leaderURI)
 
-				if !e.getLeader() {
+				if isLeader, _ := e.getLeader(); !isLeader {
 					e.reconnect()
-					return
+					return nil
 				}
 			}
 		case <-e.ctx.Done():
-			if e.getLeader() {
-				// If resign takes longer than our TTL, the lease has expired and we are no longer the leader
-				ctx, cancel := context.WithTimeout(context.Background(), time.Duration(e.ttl)*time.Second)
-				if err := e.election.Resign(ctx); err != nil {
-					log.Errorf("while resigning leadership during shutdown: %s", err)
-				}
-
-				cancel()
-			}
-
-			e.session.Close()
-
-			halt = true
-
-			return
+			return &ErrContextCanceled{}
 		case <-e.session.Done():
 			e.reconnect()
 			continue
@@ -302,7 +272,7 @@ func (e *Election) observe() (halt bool) {
 func (e *Election) reconnect() {
 	var err error
 
-	e.setLeader(false)
+	e.setLeader(false, "")
 
 	for {
 		log.Info("trying to reconnect...")
@@ -332,18 +302,22 @@ func (e *Election) reconnect() {
 	}
 }
 
-func (e *Election) setLeader(leaderState bool) {
+func (e *Election) setLeader(leaderState bool, uri ...string) {
 	if e.leader.IsLeader != leaderState {
 		e.leader.IsLeader = leaderState
+		if len(uri) > 0 {
+			e.leader.URI = uri[0]
+		}
+
 		e.leaderChan <- Leader{
 			IsLeader: leaderState,
-			URI:      "test.leader.uri",
+			URI:      e.leader.URI,
 		}
 	}
 }
 
-func (e *Election) getLeader() (isLeader bool) {
-	return e.leader.IsLeader
+func (e *Election) getLeader() (isLeader bool, leaderURI string) {
+	return e.leader.IsLeader, e.leader.URI
 }
 
 func (e *Election) newSession(ctx context.Context, leaseID int64) (err error) {
